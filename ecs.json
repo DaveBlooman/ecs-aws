@@ -1,0 +1,344 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Mappings": {
+    "RegionMap": {
+      "eu-central-1": {
+        "AMI": "ami-ffafb293"
+      },
+      "ap-northeast-1": {
+        "AMI": "ami-dae8c1b4"
+      },
+      "us-gov-west-1": {
+        "AMI": "ami-a98e33c8"
+      },
+      "sa-east-1": {
+        "AMI": "ami-4e981c22"
+      },
+      "ap-southeast-2": {
+        "AMI": "ami-eeadf58d"
+      },
+      "ap-southeast-1": {
+        "AMI": "ami-085a9a6b"
+      },
+      "us-east-1": {
+        "AMI": "ami-cbfdb2a1"
+      },
+      "us-west-2": {
+        "AMI": "ami-16cfd277"
+      },
+      "us-west-1": {
+        "AMI": "ami-0eacc46e"
+      },
+      "eu-west-1": {
+        "AMI": "ami-c26bcab1"
+      }
+    }
+  },
+  "Parameters": {
+    "ClusterSize": {
+      "Default": "3",
+      "MinValue": "3",
+      "MaxValue": "12",
+      "Description": "Number of nodes",
+      "Type": "Number"
+    },
+    "InstanceType": {
+      "Type": "String",
+      "Description": "The size of the instances",
+      "Default": "t2.small"
+    },
+    "ImageId": {
+      "Type": "String",
+      "Default": "ami-9d6fb4ee"
+    },
+    "KeyName": {
+      "Type": "AWS::EC2::KeyPair::KeyName"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id",
+      "Default": "vpc-"
+    },
+    "ECSCluster": {
+      "Type": "String",
+      "Description": "Cluster name"
+    }
+  },
+  "Resources": {
+    "ComponentAutoScalingGroup": {
+      "Type": "AWS::AutoScaling::AutoScalingGroup",
+      "UpdatePolicy": {
+        "AutoScalingRollingUpdate": {
+          "MinInstancesInService": 1,
+          "MaxBatchSize": 1,
+          "PauseTime": "PT0S"
+        }
+      },
+      "Properties": {
+        "Tags": [
+          {
+            "Value": "ecs-node",
+            "PropagateAtLaunch": true,
+            "Key": "Name"
+          }
+        ],
+        "MinSize": "3",
+        "MaxSize": "12",
+        "DesiredCapacity": {
+          "Ref": "ClusterSize"
+        },
+        "LaunchConfigurationName": {
+          "Ref": "ComponentLaunchConfiguration"
+        },
+        "AvailabilityZones": {
+          "Fn::GetAZs": ""
+        }
+      }
+    },
+    "ComponentLaunchConfiguration": {
+      "Type": "AWS::AutoScaling::LaunchConfiguration",
+      "Properties": {
+        "KeyName": {
+          "Ref": "KeyName"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "ComponentSecurityGroup"
+          }
+        ],
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "IamInstanceProfile": {
+          "Ref": "ComponentInstanceProfile"
+        },
+        "ImageId": {
+          "Fn::FindInMap": [
+            "RegionMap",
+            {
+              "Ref": "AWS::Region"
+            },
+            "AMI"
+          ]
+        },
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Join": [
+              "",
+              [
+                "#cloud-config\n",
+                "coreos:\n",
+                " units:\n",
+                "   -\n",
+                "     name: amazon-ecs-agent.service\n",
+                "     command: start\n",
+                "     runtime: true\n",
+                "     content: |\n",
+                "       [Unit]\n",
+                "       Description=Amazon ECS Agent\n",
+                "       After=docker.service\n",
+                "       Requires=docker.service\n",
+                "       Requires=network-online.target\n",
+                "       After=network-online.target\n",
+                "\n",
+                "       [Service]\n",
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "       Environment=ECS_CLUSTER=",
+                      {
+                        "Ref": "ECSCluster"
+                      },
+                      "\n"
+                    ]
+                  ]
+                },
+                "       Environment=ECS_LOGLEVEL=warn\n",
+                "       Environment=ECS_CHECKPOINT=true\n",
+                "       ExecStartPre=-/usr/bin/docker kill ecs-agent\n",
+                "       ExecStartPre=-/usr/bin/docker rm ecs-agent\n",
+                "       ExecStartPre=/usr/bin/docker pull amazon/amazon-ecs-agent\n",
+                "       ExecStart=/usr/bin/docker run --name ecs-agent --env=ECS_CLUSTER=${ECS_CLUSTER} --env=ECS_LOGLEVEL=${ECS_LOGLEVEL} --volume=/var/run/docker.sock:/var/run/docker.sock --volume=/var/lib/aws/ecs:/data amazon/amazon-ecs-agent\n",
+                "       ExecStop=/usr/bin/docker stop ecs-agent\n"
+              ]
+            ]
+          }
+        }
+      }
+    },
+    "ComponentScaleUpPolicy": {
+      "Type": "AWS::AutoScaling::ScalingPolicy",
+      "Properties": {
+        "AutoScalingGroupName": {
+          "Ref": "ComponentAutoScalingGroup"
+        },
+        "AdjustmentType": "ChangeInCapacity",
+        "Cooldown": 240,
+        "ScalingAdjustment": 1
+      }
+    },
+    "ComponentScaleDownPolicy": {
+      "Type": "AWS::AutoScaling::ScalingPolicy",
+      "Properties": {
+        "AutoScalingGroupName": {
+          "Ref": "ComponentAutoScalingGroup"
+        },
+        "AdjustmentType": "ChangeInCapacity",
+        "Cooldown": 60,
+        "ScalingAdjustment": -1
+      }
+    },
+    "CPUAlarmHigh": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Scale-up if CPU > 80% for 1 minutes",
+        "Threshold": 80,
+        "AlarmActions": [
+          {
+            "Ref": "ComponentScaleUpPolicy"
+          }
+        ],
+        "ComparisonOperator": "GreaterThanThreshold",
+        "EvaluationPeriods": "1",
+        "MetricName": "CPUUtilization",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Average",
+        "Period": 60,
+        "Dimensions": [
+          {
+            "Name": "AutoScalingGroupName",
+            "Value": {
+              "Ref": "ComponentAutoScalingGroup"
+            }
+          }
+        ]
+      }
+    },
+    "CPUAlarmLow": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Scale-down if CPU < 60% for 5 minutes",
+        "Threshold": 60,
+        "AlarmActions": [
+          {
+            "Ref": "ComponentScaleDownPolicy"
+          }
+        ],
+        "ComparisonOperator": "LessThanThreshold",
+        "EvaluationPeriods": 5,
+        "MetricName": "CPUUtilization",
+        "Namespace": "AWS/EC2",
+        "Statistic": "Average",
+        "Period": "60",
+        "Dimensions": [
+          {
+            "Name": "AutoScalingGroupName",
+            "Value": {
+              "Ref": "ComponentAutoScalingGroup"
+            }
+          }
+        ]
+      }
+    },
+    "ComponentSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "SecurityGroupIngress": [
+          {
+            "FromPort": 0,
+            "ToPort": 0,
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "GroupDescription": "A component security group allowing access to the outside world"
+      }
+    },
+    "ComponentInstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Path": "/",
+        "Roles": [
+          {
+            "Ref": "ECSRole"
+          }
+        ]
+      }
+    },
+    "EC2ComponentPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "cloudwatch:*"
+              ],
+              "Resource": [
+                "*"
+              ],
+              "Effect": "Allow"
+            },
+            {
+              "Action": [
+                "cloudformation:Describe*"
+              ],
+              "Resource": [
+                "*"
+              ],
+              "Effect": "Allow"
+            },
+            {
+              "Action": [
+                "ecs:*"
+              ],
+              "Resource": [
+                "*"
+              ],
+              "Effect": "Allow"
+            },
+            {
+              "Action": [
+                "ec2:Describe*"
+              ],
+              "Resource": [
+                "*"
+              ],
+              "Effect": "Allow"
+            }
+          ]
+        },
+        "PolicyName": "EC2ComponentPolicy",
+        "Roles": [
+          {
+            "Ref": "ECSRole"
+          }
+        ]
+      }
+    },
+    "ECSRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Path": "/",
+        "AssumeRolePolicyDocument": {
+          "Statement": [
+            {
+              "Action": [
+                "sts:AssumeRole"
+              ],
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ec2.amazonaws.com"
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
